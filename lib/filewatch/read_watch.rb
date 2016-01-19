@@ -1,13 +1,5 @@
 require "logger"
-require_relative 'watched_file'
 require_relative 'watch_base'
-
-if RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/
-  require "filewatch/winhelper"
-  INODE_METHOD = :win_inode
-else
-  INODE_METHOD = :nix_inode
-end
 
 module FileWatch
   class ReadWatch < WatchBase
@@ -23,75 +15,24 @@ module FileWatch
         return if @files.empty?
 
         file_deleteable = []
-        # look at the unwatched to see if its gone away
-        unwatched = @files.select {|k, wf| wf.closed? }
-        closed.each do |path, watched_file|
-          file_deleteable << path
-          debug_log("each: closed: #{path}, deleting from @files")
-        end
-
-        # look at the ignored to see if its changed
-        ignored = @files.select {|k, wf| wf.ignored? }
-        ignored.each do |path, watched_file|
-          begin
-            stat = watched_file.restat
-            if watched_file.size_changed? || watched_file.inode_changed?(inode(path,stat))
-              # if the ignored file changed, move it to the watched state
-              # this file has not been yielded to the block yet
-              # but we need to allow the tail to start from the ignored_size
-              # by adding this to the sincedb so that the subsequent modify
-              # event can detect the change
-              yield(:unignore, watched_file)
-              watched_file.activate
-            end
-          rescue Errno::ENOENT
-            # file has gone away or we can't read it anymore.
-            file_deleteable << path
-            debug_log("each: stat failed: #{path}: (#{$!}), deleting from @files")
-          end
+        # clean up any closed
+        @files.values.select {|wf| wf.closed? }.each do |watched_file|
+          file_deleteable << watched_file.path
+          debug_log("each: closed: #{watched_file.path}, deleting from @files")
         end
 
         # Send any creates.
-        creates = @files.select {|k, wf| wf.watched? }
-        creates.each do |path, watched_file|
-          if watched_file.initial?
-            yield(:create_initial, watched_file)
-          else
-            yield(:create, watched_file)
-          end
+        @files.values.select {|wf| wf.watched? }.each do |watched_file|
+          debug_log("each: reading: #{path}")
+          yield(:read, watched_file)
           watched_file.activate
         end
 
-        actives = @files.select {|k, wf| wf.active? }
         # wf.active? does not mean the actual files are open
         # only that the watch_file is active for further handling
-        actives.each do |path, watched_file|
-          if watched_file.file_closable?
-            debug_log("each: file expired: #{path}")
-            yield(:timeout, watched_file)
-            watched_file.close
-            next
-          end
-
-          _inode = inode(path,stat)
-          old_size = watched_file.size
-
-          if watched_file.inode_changed?(_inode)
-            debug_log("each: new inode: #{path}: old inode was #{watched_file.inode.inspect}, new is #{_inode.inspect}")
-            watched_file.update_inode(_inode)
-            yield(:delete, watched_file)
-            yield(:create, watched_file)
-            watched_file.update_size
-          elsif stat.size < old_size
-            debug_log("each: file rolled: #{path}: new size is #{stat.size}, old size #{old_size}")
-            yield(:delete, watched_file)
-            yield(:create, watched_file)
-            watched_file.update_size
-          elsif stat.size > old_size
-            debug_log("each: file grew: #{path}: old size #{old_size}, new size #{stat.size}")
-            yield(:modify, watched_file)
-            watched_file.update_size
-          end
+        @files.values.select {|wf| wf.active? }.each do |watched_file|
+          debug_log("each: reading: #{path}")
+          yield(:read_more, watched_file)
         end
 
         file_deleteable.each {|f| @files.delete(f)}
@@ -140,9 +81,10 @@ module FileWatch
           watched_file.file_close
           watched_file.unwatch
           file_deleteable << file if !new_discovery
-        else
-          @files[file] = watched_file
+
         end
+        # dont store excluded and ignored
+        @files[file] = watched_file unless watched_file.unwatched?
       end
       file_deleteable.each {|f| @files.delete(f)}
     end # def _discover_file

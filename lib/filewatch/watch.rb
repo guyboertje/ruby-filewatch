@@ -1,5 +1,4 @@
 require "logger"
-require_relative 'watched_file'
 require_relative 'watch_base'
 
 module FileWatch
