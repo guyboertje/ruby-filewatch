@@ -40,18 +40,20 @@ module FileWatch
         end
 
         # Send any reads.
-        if (to_take = @max_active - @files.values.count{|wf| wf.active?}) > 0
+        if (to_take = @max_active - @files.values.count{|wf| wf.reading_more?}) > 0
           @files.values.select {|wf| wf.watched? }.take(to_take).each do |watched_file|
           debug_log("each: reading: #{path}")
-          # read sets closed if file is read in one pass
-          # sets active if more to read
+          # read sets closed if file is read in this pass
+          # sets read_more if more to read
           yield(:read, watched_file)
         end
 
         # files bigger than the sysread batch size will still be active
         # so we have multiple passes at it
-        @files.values.select {|wf| wf.active? }.each do |watched_file|
+        @files.values.select {|wf| wf.reading_more? }.each do |watched_file|
           debug_log("each: reading: #{path}")
+          # read sets closed if file is read in this pass
+          # leaves it at read_more if more to read
           yield(:read_more, watched_file)
         end
 

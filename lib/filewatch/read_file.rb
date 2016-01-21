@@ -1,10 +1,8 @@
-require "filewatch/buftok"
-
+# TODO [boertje] Add support for ungzipping
 module FileWatch
   class ReadFile
     attr_reader :size, :inode, :state, :file
-    attr_reader :path, :filestat, :buffer, :state_history
-    attr_accessor :delimiter
+    attr_reader :path, :filestat, :state_history
 
     def delimiter
       @delimiter
@@ -28,7 +26,6 @@ module FileWatch
 
     def file_add_opened(rubyfile)
       @file = rubyfile
-      @buffer = FileWatch::BufferedTokenizer.new(delimiter || "\n")
     end
 
     def file_close
