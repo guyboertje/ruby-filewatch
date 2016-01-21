@@ -78,23 +78,6 @@ module FileWatch
       path.to_a.each { |p| @exclude << p }
     end
 
-    def watch(path)
-      synchronized do
-        if !@watching.member?(path)
-          @watching << path
-          _discover_file(path) do |filepath, stat|
-            WatchedFile.new_initial(
-              filepath, inode(filepath, stat), stat).tap do |inst|
-                inst.delimiter = @delimiter
-                inst.ignore_older = @ignore_older
-                inst.close_older = @close_older
-            end
-          end
-        end
-      end
-      return true
-    end # def watch
-
     def unwatch(path)
       synchronized do
         result = false
@@ -116,21 +99,6 @@ module FileWatch
 
     def inode(path, stat)
       self.class.inode(path, stat)
-    end
-
-    def discover
-      synchronized do
-        @watching.each do |path|
-          _discover_file(path) do |filepath, stat|
-            WatchedFile.new_ongoing(
-              filepath, inode(filepath, stat), stat).tap do |inst|
-                inst.delimiter = @delimiter
-                inst.ignore_older = @ignore_older
-                inst.close_older = @close_older
-            end
-          end
-        end
-      end
     end
 
     def subscribe(stat_interval = 1, discover_interval = 5, &block)

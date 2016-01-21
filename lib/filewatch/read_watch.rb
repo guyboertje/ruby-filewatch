@@ -4,6 +4,24 @@ require_relative 'watch_base'
 module FileWatch
   class ReadWatch < WatchBase
 
+    def discover
+      synchronized do
+        @watching.each do |path|
+          _discover_file(path)
+        end
+      end
+    end
+
+    def watch(path)
+      synchronized do
+        if !@watching.member?(path)
+          @watching << path
+          _discover_file(path)
+        end
+      end
+      return true
+    end # def watch
+
     # Calls &block with params [event_type, path]
     # event_type can be one of:
     #   :create_initial - initially present file (so start at end for tail)
@@ -21,15 +39,17 @@ module FileWatch
           debug_log("each: closed: #{watched_file.path}, deleting from @files")
         end
 
-        # Send any creates.
-        @files.values.select {|wf| wf.watched? }.each do |watched_file|
+        # Send any reads.
+        if (to_take = @max_active - @files.values.count{|wf| wf.active?}) > 0
+          @files.values.select {|wf| wf.watched? }.take(to_take).each do |watched_file|
           debug_log("each: reading: #{path}")
+          # read sets closed if file is read in one pass
+          # sets active if more to read
           yield(:read, watched_file)
-          watched_file.activate
         end
 
-        # wf.active? does not mean the actual files are open
-        # only that the watch_file is active for further handling
+        # files bigger than the sysread batch size will still be active
+        # so we have multiple passes at it
         @files.values.select {|wf| wf.active? }.each do |watched_file|
           debug_log("each: reading: #{path}")
           yield(:read_more, watched_file)
@@ -53,7 +73,10 @@ module FileWatch
           debug_log("_discover_file: #{path}: new: #{file} (exclude is #{@exclude.inspect})")
           # let the caller build the object in its context
           new_discovery = true
-          watched_file = yield(file, File::Stat.new(file))
+          stat = File::Stat.new(file)
+          watched_file = ReadFile.new(file, inode(file, stat), stat).tap do |inst|
+                inst.delimiter = @delimiter
+              end
         end
 
         skip = false

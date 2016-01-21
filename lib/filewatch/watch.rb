@@ -5,6 +5,39 @@ module FileWatch
   #AKA TailWatch
   class Watch < WatchBase
     public
+
+    def discover
+      synchronized do
+        @watching.each do |path|
+          _discover_file(path) do |filepath, stat|
+            WatchedFile.new_ongoing(
+              filepath, inode(filepath, stat), stat).tap do |inst|
+                inst.delimiter = @delimiter
+                inst.ignore_older = @ignore_older
+                inst.close_older = @close_older
+            end
+          end
+        end
+      end
+    end
+
+    def watch(path)
+      synchronized do
+        if !@watching.member?(path)
+          @watching << path
+          _discover_file(path) do |filepath, stat|
+            WatchedFile.new_initial(
+              filepath, inode(filepath, stat), stat).tap do |inst|
+                inst.delimiter = @delimiter
+                inst.ignore_older = @ignore_older
+                inst.close_older = @close_older
+            end
+          end
+        end
+      end
+      return true
+    end # def watch
+
     # Calls &block with params [event_type, path]
     # event_type can be one of:
     #   :create_initial - initially present file (so start at end for tail)
