@@ -1,5 +1,6 @@
 require "filewatch/yielding_tail"
 require "filewatch/observing_tail"
+require "filewatch/context_accepting_tail"
 require "forwardable"
 
 module FileWatch
@@ -13,6 +14,12 @@ module FileWatch
     def self.new_observing(opts = {})
       new.tap do |instance|
         instance.target = ObservingTail.new(opts)
+      end
+    end
+
+    def self.new_accepting(opts = {})
+      new.tap do |instance|
+        instance.target = ContextAcceptingTail.new(opts)
       end
     end
 

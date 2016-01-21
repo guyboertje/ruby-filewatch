@@ -1,5 +1,13 @@
 require 'filewatch/watch'
 require 'stud/temporary'
+require_relative 'helpers/spec_helper'
+## A note about the sequence delay times.
+#  because the file mtimes and close_older etc.
+#  are never more granular than 1 second,
+#  when delay times are floats the measured time
+#  can be rounded up or down.
+#  so try to use float delays closer to the best integer
+#  where it matters
 
 describe FileWatch::Watch do
   before(:all) do
@@ -12,207 +20,368 @@ describe FileWatch::Watch do
   end
 
   let(:directory) { Stud::Temporary.directory }
+  let(:watch_dir) { File.join(directory, "*.log") }
   let(:file_path) { File.join(directory, "1.log") }
-  let(:loggr)     { double("loggr", :debug? => true) }
+  let(:loggr)     { FileWatch::FileLogTracer.new }
   let(:results)   { [] }
-  let(:quit_sleep) { 1 }
   let(:stat_interval) { 0.1 }
   let(:discover_interval) { 4 }
-  let(:write_3_and_4_sleep) { 0.5 }
-
-  let(:quit_proc) do
-    lambda do
-      Thread.new do
-        sleep quit_sleep
-        subject.quit
-      end
-    end
-  end
 
   let(:subscribe_proc) do
     lambda do
-      subject.subscribe(stat_interval, discover_interval) do |event, path|
-        results.push([event, path])
-      end
-    end
-  end
-
-  let(:write_lines_1_and_2_proc) do
-    lambda do
-      File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
-    end
-  end
-
-  let(:write_lines_3_and_4_proc) do
-    lambda do
-      Thread.new do
-        sleep write_3_and_4_sleep
-        File.open(file_path, "ab") { |file|  file.write("line3\nline4\n") }
+      formatted_puts("subscribing")
+      subject.subscribe(stat_interval, discover_interval) do |event, watched_file|
+        results.push([event, watched_file.path])
       end
     end
   end
 
   subject { FileWatch::Watch.new(:logger => loggr) }
 
-  before do
-    allow(loggr).to receive(:debug)
-  end
   after do
     FileUtils.rm_rf(directory)
   end
 
+  describe "max open files" do
+    let(:max) { 1 }
+    let(:file_path2) { File.join(directory, "2.log") }
+    let(:wait_before_quit) { 0.25 }
+    let(:actions) do
+      RSpec::Sequencing
+        .run("create file and watch directory") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+          File.open(file_path2, "wb") { |file|  file.write("lineA\nlineB\n") }
+          subject.watch(watch_dir)
+        end
+        .then_after(wait_before_quit, "quit after a short time") do
+          subject.quit
+        end
+    end
+
+    before { actions.activate }
+    after  { ENV.delete("FILEWATCH_MAX_OPEN_FILES") }
+
+    context "when using ENV" do
+      it "opens only 1 file" do
+        ENV["FILEWATCH_MAX_OPEN_FILES"] = max.to_s
+        expect(subject.max_active).to eq(max)
+        subscribe_proc.call
+        expect(results).to eq([[:create_initial, file_path], [:modify, file_path]])
+      end
+    end
+
+    context "when using #max_open_files=" do
+      it "opens only 1 file" do
+        expect(subject.max_active).to eq(4095)
+        subject.max_open_files = max
+        expect(subject.max_active).to eq(max)
+        subscribe_proc.call
+        expect(results).to eq([[:create_initial, file_path], [:modify, file_path]])
+      end
+    end
+
+    context "when close_older is set" do
+      let(:wait_before_quit) { 2.25 }
+      it "opens both files" do
+        subject.max_open_files = max
+        subject.close_older = 1 #seconds
+        subscribe_proc.call
+        expect(results).to eq([
+            [:create_initial, file_path], [:modify, file_path], [:timeout, file_path],
+            [:create_initial, file_path2], [:modify, file_path2], [:timeout, file_path2]
+          ])
+      end
+    end
+  end
+
   context "when watching a directory with files" do
+    let(:actions) do
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(0.25, "start watching when directory has files") do
+          subject.watch(watch_dir)
+        end
+        .then_after(0.55, "quit after a short time") do
+          subject.quit
+        end
+    end
+
     it "yields create_initial and one modify file events" do
-      write_lines_1_and_2_proc.call
-      subject.watch(File.join(directory, "*"))
-      quit_proc.call
+      actions.activate
       subscribe_proc.call
       expect(results).to eq([[:create_initial, file_path], [:modify, file_path]])
     end
   end
 
   context "when watching a directory without files and one is added" do
+    before do
+      RSpec::Sequencing
+        .run("start watching before any files are written") do
+          subject.watch(watch_dir)
+        end
+        .then_after(0.25, "create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(0.45, "quit after a short time") do
+          subject.quit
+        end
+    end
+
     it "yields create and one modify file events" do
-      subject.watch(File.join(directory, "*"))
-      write_lines_1_and_2_proc.call
-
-      quit_proc.call
       subscribe_proc.call
-
       expect(results).to eq([[:create, file_path], [:modify, file_path]])
     end
   end
 
-  context "when watching a directory with files and data is appended" do
+  context "when watching a directory with files and a file is renamed to not match glob" do
+    let(:new_file_path) { file_path + ".old" }
+    before do
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(0.25, "start watching after files are written") do
+          subject.watch(watch_dir)
+        end
+        .then_after(0.55, "rename file") do
+          FileUtils.mv(file_path, new_file_path)
+        end
+        .then_after(0.55, "then write to renamed file") do
+          File.open(new_file_path, "ab") { |file|  file.write("line3\nline4\n") }
+        end
+        .then_after(0.45, "quit after a short time") do
+          subject.quit
+        end
+    end
 
+    it "yields create_initial,one modify and a delete file events" do
+      subscribe_proc.call
+      expect(results).to eq([[:create_initial, file_path], [:modify, file_path], [:delete, file_path]])
+    end
+  end
+
+  context "when watching a directory with files and a file is renamed to match glob" do
+    let(:new_file_path) { file_path + "2.log" }
+    before do
+      subject.close_older = 0
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(0.25, "start watching after files are written") do
+          subject.watch(watch_dir)
+        end
+        .then_after(0.55, "rename file") do
+          FileUtils.mv(file_path, new_file_path)
+        end
+        .then("then write to renamed file") do
+          File.open(new_file_path, "ab") { |file|  file.write("line3\nline4\n") }
+        end
+        .then_after(2.75, "quit after a short time") do
+          subject.quit
+        end
+    end
+
+    it "yields create_initial, a modify, a delete, a create and a modify file events" do
+      subscribe_proc.call
+      expect(results).to eq([
+          [:create_initial, file_path], [:modify, file_path], [:delete, file_path],
+          [:create, new_file_path], [:modify, new_file_path]
+        ])
+    end
+  end
+
+  context "when watching a directory with files and data is appended" do
+    before do
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(0.25, "start watching after file is written") do
+          subject.watch(watch_dir)
+        end
+        .then_after(0.45, "append more lines to the file") do
+          File.open(file_path, "ab") { |file|  file.write("line3\nline4\n") }
+        end
+        .then_after(0.45, "quit after a short time") do
+          subject.quit
+        end
+    end
 
     it "yields create_initial and two modified file events" do
-      write_lines_1_and_2_proc.call
-      subject.watch(File.join(directory, "*"))
-
-      write_lines_3_and_4_proc.call # asynchronous
-
-      quit_proc.call
       subscribe_proc.call
-
       expect(results).to eq([[:create_initial, file_path], [:modify, file_path], [:modify, file_path]])
     end
   end
 
   context "when unwatching a file and data is appended" do
-    let(:write_lines_3_and_4_proc) do
-      lambda do
-        Thread.new do
-          sleep 0.2
+    before do
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(0.25, "start watching after file is written") do
+          subject.watch(watch_dir)
+        end
+        .then_after(0.25, "unwatch the file") do
           results.clear
           subject.unwatch(file_path)
-          sleep 0.2
+        end
+        .then_after(0.25, "append more lines to the file") do
           File.open(file_path, "ab") { |file|  file.write("line3\nline4\n") }
         end
-      end
+        .then_after(0.45, "quit after a short time") do
+          subject.quit
+        end
     end
 
     it "does not yield events after unwatching" do
-      write_lines_1_and_2_proc.call
-      subject.watch(File.join(directory, "*"))
-
-      write_lines_3_and_4_proc.call # asynchronous
-
-      quit_proc.call
       subscribe_proc.call
-
       expect(results).to eq([])
     end
   end
 
   context "when close older expiry is enabled" do
-    let(:quit_sleep) { 3.5 }
-    let(:stat_interval) { 0.2 }
-
     before do
       subject.close_older = 2
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then("start watching before file ages more than close_older") do
+          subject.watch(watch_dir)
+        end
+        .then_after(3.1, "quit after allowing time to close the file") do
+          subject.quit
+        end
     end
 
     it "yields create_initial, modify and timeout file events" do
-      write_lines_1_and_2_proc.call
-      subject.watch(File.join(directory, "*"))
-      quit_proc.call
       subscribe_proc.call
       expect(results).to eq([[:create_initial, file_path], [:modify, file_path], [:timeout, file_path]])
     end
   end
 
   context "when close older expiry is enabled and after timeout the file is appended-to" do
-    let(:quit_sleep) { 6.5 }
-    let(:stat_interval) { 0.2 }
-    let(:write_3_and_4_sleep) { 3.5 }
-
     before do
       subject.close_older = 2
+
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then("start watching before file ages more than close_older") do
+          subject.watch(watch_dir)
+        end
+        .then_after(3.1, "append more lines to file after file ages more than close_older") do
+          File.open(file_path, "ab") { |file|  file.write("line3\nline4\n") }
+        end
+        .then_after(3.1, "quit after allowing time to close the file") do
+          subject.quit
+        end
     end
 
     it "yields create_initial, modify, timeout then modify, timeout file events" do
-      write_lines_1_and_2_proc.call
-      write_lines_3_and_4_proc.call # delayed async call
-      subject.watch(File.join(directory, "*"))
-      quit_proc.call
       subscribe_proc.call
       expect(results).to eq([[:create_initial, file_path], [:modify, file_path], [:timeout, file_path], [:modify, file_path], [:timeout, file_path]])
     end
   end
 
   context "when ignore older expiry is enabled and all files are already expired" do
-    let(:quit_sleep) { 3 }
-    let(:stat_interval) { 0.2 }
-
     before do
-      File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
       subject.ignore_older = 1
+
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(2, "start watching after file ages more than ignore_older") do
+          subject.watch(watch_dir)
+        end
+        .then_after(1, "quit after allowing time to close the file") do
+          subject.quit
+        end
     end
 
-    it "yields only create_initial file event" do
-      sleep 2
-      subject.watch(File.join(directory, "*"))
-      quit_proc.call
+    it "yields no file events" do
       subscribe_proc.call
-      expect(results).to eq([[:create_initial, file_path]])
+      expect(results).to eq([])
     end
   end
 
   context "when ignore_older is less than close_older and all files are not expired" do
-    let(:quit_sleep) { 3 }
-    let(:stat_interval) { 0.2 }
-
     before do
-      File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
       subject.ignore_older = 1
       subject.close_older = 2
+
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then("start watching before file age reaches ignore_older") do
+          subject.watch(watch_dir)
+        end
+        .then_after(3.1, "quit after allowing time to close the file") do
+          subject.quit
+        end
     end
 
     it "yields create_initial, modify, timeout file events" do
-      subject.watch(File.join(directory, "*"))
-      quit_proc.call
       subscribe_proc.call
       expect(results).to eq([[:create_initial, file_path], [:modify, file_path], [:timeout, file_path]])
     end
   end
 
   context "when ignore_older is less than close_older and all files are expired" do
-    let(:quit_sleep) { 3 }
-    let(:stat_interval) { 0.2 }
-
     before do
-      File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
       subject.ignore_older = 1
       subject.close_older = 2
+
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(1.95, "start watching after file ages more than ignore_older") do
+          subject.watch(watch_dir)
+        end
+        .then_after(1.25, "quit after allowing time to close the file") do
+          subject.quit
+        end
     end
 
-    it "yields create_initial, modify, timeout file events" do
-      sleep 1.9
-      subject.watch(File.join(directory, "*"))
-      quit_proc.call
+    it "yields no file events" do
       subscribe_proc.call
-      expect(results).to eq([[:create_initial, file_path], [:timeout, file_path]])
+      expect(results).to eq([])
+    end
+  end
+
+  context "when ignore older and close older expiry is enabled and after timeout the file is appended-to" do
+    before do
+      subject.ignore_older = 2
+      subject.close_older = 1
+
+      RSpec::Sequencing
+        .run("create file") do
+          File.open(file_path, "wb") { |file|  file.write("line1\nline2\n") }
+        end
+        .then_after(3.1, "start watching after file ages more than ignore_older") do
+          subject.watch(watch_dir)
+        end
+        .then("append more lines to file after file ages more than ignore_older") do
+          File.open(file_path, "ab") { |file|  file.write("line3\nline4\n") }
+        end
+        .then_after(2.1, "quit after allowing time to close the file") do
+          subject.quit
+        end
+    end
+
+    it "yields unignore, modify then timeout file events" do
+      subscribe_proc.call
+      expect(results).to eq([
+          [:unignore, file_path], [:modify, file_path], [:timeout, file_path]
+        ])
     end
   end
 end
